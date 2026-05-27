@@ -1,0 +1,69 @@
+# MA-LMM config for Ego4D hour-long video captioning (inference only)
+# Key differences from youcook2:
+#   - num_frames: 80 (same — sparse sampling of hour-long video)
+#   - memory_bank_length: 40 (default — demonstrates saturation)
+#   - max_num_frames: 200 (extended for longer videos)
+#   - evaluate: True (inference only)
+
+model:
+  arch: blip2_vicuna_instruct_malmm
+  model_type: vicuna7b
+  load_finetuned: False
+  load_pretrained: True
+
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+
+  num_query_token: 32
+  llm_model: "llm/vicuna-7b"
+  prompt: "Describe what happens in this video in detail."
+
+  # Memory bank config — the key experimental variable
+  memory_bank_length: 40      # fixed slots; on 1hr video, each slot = ~90 seconds
+  num_frames: 80              # how many frames are sampled from the full video
+  max_num_frames: 200         # positional embedding limit (extended from default 120)
+
+datasets:
+  ego4d_caption:
+    vis_processor:
+      eval:
+        name: "blip2_video_eval"
+        image_size: 224
+    text_processor:
+      eval:
+        name: "blip_caption"
+        prompt: "Describe what happens in this video in detail."
+    num_frames: 80
+    build_info:
+      images:
+        storage: "data/ego4d/frames"
+      annotations:
+        val:
+          url: "data/ego4d/annotations/ego4d_eval.json"
+          md5: null
+          storage: "data/ego4d/annotations/ego4d_eval.json"
+
+run:
+  task: captioning
+  seed: 42
+  output_dir: "outputs/exp01_memory_saturation"
+
+  max_len: 512
+  min_len: 20
+  num_beams: 5
+
+  batch_size_eval: 1          # process one hour-long video at a time
+  num_workers: 4
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: False
+
+  evaluate: True
+  valid_splits: ["val"]
+  report_metric: True
+  prefix: "ego4d_eval"
