@@ -1,19 +1,21 @@
 #!/bin/bash
 # Quick end-to-end test of the MA-LMM captioning pipeline on YouTube clips.
 #
-# Downloads a few short YouTube segments, extracts frames, runs inference,
-# and prints generated captions.
+# Searches YouTube for 3 clips (cooking, walking POV, basketball),
+# downloads the first result for each, trims to 60s, runs the full pipeline.
 #
 # USAGE:
 #   bash scripts/test_youtube_pipeline.sh
 #
+#   # Or pass your own search queries:
+#   SEARCHES="cooking tutorial,city walk pov,basketball highlights" \
+#     bash scripts/test_youtube_pipeline.sh
+#
 # PREREQUISITES:
-#   pip install yt-dlp
-#   ffmpeg installed (apt install ffmpeg)
+#   pip install -U yt-dlp        (upgrade if you have an old version)
+#   apt install ffmpeg
 #   MA-LMM cloned to MA-LMM/  and pip install -e MA-LMM/
 #   Vicuna-7b weights at MA-LMM/llm/vicuna-7b/
-#
-# To test with your own URLs, edit the VIDEOS array below.
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,13 +32,11 @@ ANN_PATH="data/youtube_test/annotations/yt_eval.json"
 OUT_DIR="outputs/youtube_test"
 LLM_MODEL="MA-LMM/llm/vicuna-7b"
 
-# ── Test videos: (label, YouTube URL) ─────────────────────
-# Mix of eventful and sparse/repetitive — mirrors the Ego4D experiment intent.
-declare -A VIDEOS=(
-    ["cooking_tasty"]="https://www.youtube.com/watch?v=SIBs4PcqEaE"
-    ["city_walk_pov"]="https://www.youtube.com/watch?v=P0RcELiJmzc"
-    ["basketball_game"]="https://www.youtube.com/watch?v=8wYsavdZDRc"
-)
+# ── Search queries → clip labels ──────────────────────────
+# Uses yt-dlp "ytsearch1:QUERY" — no hardcoded URLs, always finds real videos.
+# Format: "label:search query" separated by commas. Override via env var.
+DEFAULT_SEARCHES="cooking_recipe:how to cook pasta,city_walk_pov:first person city walking tour,basketball_game:basketball game highlights"
+IFS=',' read -ra SEARCH_PAIRS <<< "${SEARCHES:-$DEFAULT_SEARCHES}"
 
 # ─────────────────────────────────────────────────────────
 
@@ -50,7 +50,7 @@ echo "[check] Dependencies..."
 for cmd in yt-dlp ffmpeg python3; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "  MISSING: $cmd"
-        echo "  Install: pip install yt-dlp  /  apt install ffmpeg"
+        echo "  Install: pip install -U yt-dlp  /  apt install ffmpeg"
         exit 1
     fi
 done
@@ -69,8 +69,9 @@ echo ""
 echo "[1/4] Downloading and trimming YouTube clips..."
 mkdir -p "$VIDEO_DIR"
 
-for label in "${!VIDEOS[@]}"; do
-    url="${VIDEOS[$label]}"
+for pair in "${SEARCH_PAIRS[@]}"; do
+    label="${pair%%:*}"
+    query="${pair#*:}"
     out_path="$VIDEO_DIR/${label}.mp4"
 
     if [ -f "$out_path" ]; then
@@ -78,21 +79,22 @@ for label in "${!VIDEOS[@]}"; do
         continue
     fi
 
-    echo "  --> $label"
-    echo "      URL: $url"
+    echo "  --> $label  (search: \"$query\")"
 
-    # Download best mp4 up to 720p (fast), then trim with ffmpeg
     tmp_path="/tmp/yt_raw_${label}.mp4"
+    rm -f "$tmp_path"
 
+    # Search YouTube and download first result, best mp4 up to 720p
     yt-dlp \
-        -f "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best" \
+        -f "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best" \
         --merge-output-format mp4 \
+        --no-playlist \
         -o "$tmp_path" \
-        "$url" \
-        2>&1 | grep -E "Downloading|Merging|ERROR|WARNING" || true
+        "ytsearch1:${query}" \
+        2>&1 | grep -E "^\[youtube\]|Destination|ERROR" || true
 
     if [ ! -f "$tmp_path" ]; then
-        echo "  ERROR: Download failed for $label — skipping"
+        echo "  ERROR: Download failed for '$query' — skipping"
         continue
     fi
 
