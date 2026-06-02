@@ -13,18 +13,20 @@ this is the vanilla baseline.
 
 ```
 ma_lmm_baseline/
+├── preflight.sh              # scans /workspace/ for assets already on the pod
 ├── setup.sh                  # clones MA-LMM, conda env, installs deps, downloads Vicuna
 ├── prepare_frames.sh         # 10 FPS frame extraction + annotation JSON
 ├── run_inference.sh          # runs zero-shot captioning on 10/30/60 min variants
 ├── configs/
 │   └── cap_ego4d.yaml        # minimal MA-LMM config (used by infer.py for the model)
 ├── scripts/
+│   ├── preflight.py          # inspects /workspace/, writes preflight_report.json
 │   ├── extract_frames.py     # ffmpeg @ 10 fps (matches official preprocess recipe)
 │   ├── make_annotation.py    # builds MA-LMM-style annotation JSON
 │   └── infer.py              # inference driver using lavis.models.load_model_and_preprocess
 ├── MA-LMM/                   # cloned by setup.sh (gitignored)
 └── data/
-    ├── videos/{10min,30min,60min}/      # YOU put your videos here
+    ├── videos/{10min,30min,60min}/      # YOU put (or symlink) your videos here
     ├── frames/{10min,30min,60min}/      # produced by prepare_frames.sh
     └── annotations/ego4d_{10min,30min,60min}.json
 ```
@@ -62,14 +64,28 @@ you can join results across durations.
 git clone -b only_MALMM https://github.com/AshishRMenon/Video_understanding.git
 cd Video_understanding/ma_lmm_baseline
 
-# 1) one-time setup (~20 min, dominated by Vicuna-7b download)
+# 1) Preflight: scan /workspace/ for assets that may already exist
+#    (Vicuna, long Ego4D videos, 10/30/60-min variants, MA-LMM clone,
+#    conda env). Reads only — does not modify anything. Writes
+#    preflight_report.json with concrete symlink suggestions.
+WORKSPACE=/workspace bash preflight.sh
+# Then wire any existing assets into the expected paths as the
+# preflight summary suggests, e.g.:
+#   mkdir -p MA-LMM/llm && ln -s /workspace/vicuna-7b MA-LMM/llm/vicuna-7b
+#   ln -s /workspace/videos/10min  data/videos/10min
+#   ln -s /workspace/videos/30min  data/videos/30min
+#   ln -s /workspace/videos/60min  data/videos/60min
+
+# 2) one-time setup (~20 min, dominated by Vicuna-7b download IF NOT FOUND)
+#    setup.sh is idempotent — it skips the clone if MA-LMM/ already
+#    exists and skips the HF download if MA-LMM/llm/vicuna-7b is populated.
 bash setup.sh
 conda activate malmm_baseline
 
-# 2) frames + annotations
+# 3) frames + annotations
 bash prepare_frames.sh
 
-# 3) inference (zero-shot)
+# 4) inference (zero-shot)
 bash run_inference.sh
 ```
 
