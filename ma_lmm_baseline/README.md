@@ -58,14 +58,18 @@ you can join results across durations.
 ## Quickstart
 
 ```bash
-# one-time setup (~20 min, dominated by Vicuna-7b download)
+# 0) Clone this repo on the only_MALMM branch
+git clone -b only_MALMM https://github.com/AshishRMenon/Video_understanding.git
+cd Video_understanding/ma_lmm_baseline
+
+# 1) one-time setup (~20 min, dominated by Vicuna-7b download)
 bash setup.sh
 conda activate malmm_baseline
 
-# frames + annotations
+# 2) frames + annotations
 bash prepare_frames.sh
 
-# inference (zero-shot)
+# 3) inference (zero-shot)
 bash run_inference.sh
 ```
 
