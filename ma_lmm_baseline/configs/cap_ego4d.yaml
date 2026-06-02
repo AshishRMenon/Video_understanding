@@ -1,0 +1,54 @@
+# Minimal MA-LMM config for Ego4D captioning. Mirrors
+# MA-LMM/lavis/projects/malmm/cap_youcook2.yaml with memory/frame knobs
+# tuned for hour-long videos. infer.py does not parse this file directly
+# (it calls load_model_and_preprocess and overrides at runtime), but the
+# file is kept here as a reference for finetuning or direct LAVIS runs.
+
+model:
+  arch: blip2_vicuna_instruct
+  model_type: vicuna7b
+  load_finetuned: False
+  load_pretrained: True
+
+  image_size: 224
+  drop_path_rate: 0
+  use_grad_checkpoint: False
+  vit_precision: "fp16"
+  freeze_vit: True
+
+  num_query_token: 32
+  llm_model: "llm/vicuna-7b"
+  prompt: ""
+
+  memory_bank_length: 40
+  num_frames: 80
+
+datasets:
+  ego4d_caption:
+    vis_processor:
+      eval:
+        name: "blip2_video_eval"
+        image_size: 224
+    text_processor:
+      eval:
+        name: "blip_caption"
+        prompt: "Describe what happens in this video in detail."
+    num_frames: 80
+
+run:
+  task: captioning
+  batch_size_eval: 1
+  num_workers: 4
+  max_len: 256
+  min_len: 10
+  num_beams: 5
+  seed: 42
+  output_dir: "output"
+  amp: True
+  evaluate: True
+  test_splits: ["test"]
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: False
+  report_metric: False
