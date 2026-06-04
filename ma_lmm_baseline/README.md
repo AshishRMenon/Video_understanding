@@ -1,158 +1,237 @@
 # MA-LMM Baseline — Ego4D 10 / 30 / 60 min
 
-A clean folder that **clones the official [MA-LMM](https://github.com/boheumd/MA-LMM)
-repo as-is** and runs its zero-shot captioning pipeline on three duration
-variants (10 / 30 / 60 minutes) of 5 hour-long Ego4D videos.
-
-No memory-instrumentation, no diversity metric, no analysis stage —
-this is the vanilla baseline.
+Zero-shot captioning of long Ego4D videos using the official
+[MA-LMM](https://github.com/boheumd/MA-LMM) pipeline — EVA-CLIP-G vision
+encoder → Q-Former with memory bank → Vicuna-7b-v1.3 LLM. No fine-tuning,
+no workarounds.
 
 ---
 
-## Layout
+## How MA-LMM works (briefly)
+
+MA-LMM processes video frames sequentially through a Q-Former that maintains
+a **memory bank** compressing visual context across time. The accumulated
+visual embeddings are projected as prefix tokens into Vicuna-7b, which
+generates a single coherent caption. This is end-to-end vision-language —
+Vicuna receives visual tokens, not text.
+
+---
+
+## Repository layout
 
 ```
 ma_lmm_baseline/
-├── preflight.sh              # scans /workspace/ for assets already on the pod
-├── setup.sh                  # clones MA-LMM, conda env, installs deps, downloads Vicuna
-├── prepare_frames.sh         # 10 FPS frame extraction + annotation JSON
-├── run_inference.sh          # runs zero-shot captioning on 10/30/60 min variants
-├── configs/
-│   └── cap_ego4d.yaml        # minimal MA-LMM config (used by infer.py for the model)
+├── setup.sh                  # one-time bootstrap (conda, deps, Vicuna download)
+├── prepare_frames.sh         # FFmpeg frame extraction + annotation JSON
+├── run_inference.sh          # runs infer.py on 10/30/60-min variants
+├── preflight.sh              # optional: scan /workspace/ for pre-existing assets
 ├── scripts/
-│   ├── preflight.py          # inspects /workspace/, writes preflight_report.json
-│   ├── extract_frames.py     # ffmpeg @ 10 fps (matches official preprocess recipe)
+│   ├── infer.py              # main inference driver (uses real MALMM pipeline)
+│   ├── infer_v2.py           # two-stage workaround (NOT the MALMM pipeline — kept for reference)
+│   ├── extract_frames.py     # FFmpeg @ 10 FPS
 │   ├── make_annotation.py    # builds MA-LMM-style annotation JSON
-│   └── infer.py              # inference driver using lavis.models.load_model_and_preprocess
-├── MA-LMM/                   # cloned by setup.sh (gitignored)
+│   └── preflight.py          # scans /workspace/ for assets
+├── configs/
+│   └── cap_ego4d.yaml        # reference MA-LMM config
 └── data/
-    ├── videos/{10min,30min,60min}/      # YOU put (or symlink) your videos here
-    ├── frames/{10min,30min,60min}/      # produced by prepare_frames.sh
-    └── annotations/ego4d_{10min,30min,60min}.json
+    ├── videos/{10min,30min,60min}/   # put your MP4s here
+    ├── frames/{10min,30min,60min}/   # produced by prepare_frames.sh
+    └── annotations/                  # produced by prepare_frames.sh
 ```
+
+`MA-LMM/` (cloned by `setup.sh`) and `data/` are gitignored — they contain
+large binaries.
 
 ---
 
-## Data layout you need to provide
+## Prerequisites
 
-Put the 5 videos × 3 durations under `data/videos/`:
+| Requirement | Value |
+|---|---|
+| GPU VRAM | ≥ 24 GB (40 GB+ recommended for 60-min @ 80 frames) |
+| CUDA | 11.8 |
+| Python | 3.9 or 3.10 |
+| Disk | ≥ 60 GB (Vicuna ~13 GB + frames) |
+
+**Recommended RunPod template:**
+`runpod/pytorch:2.0.1-py3.10-cuda11.8.0-devel-ubuntu22.04`
+
+Avoid PyTorch ≥ 2.1 — `fairscale==0.4.4` and `timm==0.4.12` hit breaking
+API changes (`torch._six`, `Tensor.storage()`) on newer versions.
+
+---
+
+## Step-by-step setup
+
+### 1. Clone this repo (only_MALMM branch)
+
+```bash
+git clone -b only_MALMM https://github.com/AshishRMenon/Video_understanding.git
+cd Video_understanding/ma_lmm_baseline
+```
+
+### 2. (Optional) Preflight scan
+
+If you are on a pod that may already have Vicuna weights or videos, run this
+first. It scans `/workspace/` and prints symlink suggestions so you don't
+re-download what's already there.
+
+```bash
+WORKSPACE=/workspace bash preflight.sh
+# Then follow the suggestions, e.g.:
+#   mkdir -p MA-LMM/llm
+#   ln -s /workspace/existing_vicuna  MA-LMM/llm/vicuna-7b-v1.3
+#   ln -s /workspace/videos/10min     data/videos/10min
+```
+
+### 3. Run setup.sh
+
+```bash
+bash setup.sh
+conda activate malmm_baseline
+```
+
+This script (idempotent — safe to re-run):
+1. Installs `ffmpeg` if missing
+2. Installs Miniconda if missing
+3. Clones the official MA-LMM repo into `MA-LMM/`
+4. Creates conda env `malmm_baseline` (Python 3.9)
+5. Installs PyTorch 2.0.1 + CUDA 11.8, then `pip install -e MA-LMM/`
+6. Downloads **Vicuna-7b-v1.3** (~13 GB) to `MA-LMM/llm/vicuna-7b-v1.3/`
+
+> **Why v1.3 specifically?** The pretrained Q-Former checkpoint
+> (`instruct_blip_vicuna7b_trimmed.pth`) has its projection layer trained
+> against Vicuna v1.3's embedding space. Using v1.5 causes degenerate output
+> (captions filled with `OOOOO...` or `1. 1. 1. 1.`).
+
+### 4. Verify the LAVIS config points to v1.3
+
+After cloning, confirm this line in
+`MA-LMM/lavis/configs/models/blip2/blip2_instruct_vicuna7b.yaml`:
+
+```yaml
+llm_model: "/workspace/Video_understanding/ma_lmm_baseline/MA-LMM/llm/vicuna-7b-v1.3"
+```
+
+If it points anywhere else, update it to match your actual path to the v1.3
+weights. This is the single most common cause of garbled output.
+
+### 5. Put your videos in place
 
 ```
 data/videos/
-├── 10min/
-│   ├── <video_id_1>.mp4
-│   ├── <video_id_2>.mp4
-│   ├── <video_id_3>.mp4
-│   ├── <video_id_4>.mp4
-│   └── <video_id_5>.mp4
-├── 30min/
-│   └── ...
-└── 60min/
-    └── ...
+├── 10min/  ← 5 × ~10-min Ego4D clips (.mp4)
+├── 30min/  ← 5 × ~30-min clips
+└── 60min/  ← 5 × ~60-min clips
 ```
 
-Filenames don't matter — whatever stem you use becomes the `video_id`.
-Keeping the stems consistent across the three folders is recommended so
-you can join results across durations.
+Filenames become the `video_id` in outputs. You can symlink instead of copying.
 
----
-
-## Quickstart
+### 6. Extract frames and build annotations
 
 ```bash
-# 0) Clone this repo on the only_MALMM branch
-git clone -b only_MALMM https://github.com/AshishRMenon/Video_understanding.git
-cd Video_understanding/ma_lmm_baseline
-
-# 1) Preflight: scan /workspace/ for assets that may already exist
-#    (Vicuna, long Ego4D videos, 10/30/60-min variants, MA-LMM clone,
-#    conda env). Reads only — does not modify anything. Writes
-#    preflight_report.json with concrete symlink suggestions.
-WORKSPACE=/workspace bash preflight.sh
-# Then wire any existing assets into the expected paths as the
-# preflight summary suggests, e.g.:
-#   mkdir -p MA-LMM/llm && ln -s /workspace/vicuna-7b MA-LMM/llm/vicuna-7b
-#   ln -s /workspace/videos/10min  data/videos/10min
-#   ln -s /workspace/videos/30min  data/videos/30min
-#   ln -s /workspace/videos/60min  data/videos/60min
-
-# 2) one-time setup (~20 min, dominated by Vicuna-7b download IF NOT FOUND)
-#    setup.sh is idempotent — it skips the clone if MA-LMM/ already
-#    exists and skips the HF download if MA-LMM/llm/vicuna-7b is populated.
-bash setup.sh
-conda activate malmm_baseline
-
-# 3) frames + annotations
 bash prepare_frames.sh
+```
 
-# 4) inference (zero-shot)
+Extracts at 10 FPS (`scale=-1:256`) and writes
+`data/annotations/ego4d_{10min,30min,60min}.json`.
+
+### 7. Run inference
+
+```bash
 bash run_inference.sh
 ```
 
-Tweak the inference knobs via env vars:
+Or target a single duration directly:
+
+```bash
+conda activate malmm_baseline
+python scripts/infer.py \
+    --frame_dir data/frames/10min \
+    --ann_path  data/annotations/ego4d_10min.json \
+    --output    outputs/captions_10min.json \
+    --memory_bank_length 40 \
+    --num_frames 80
+```
+
+Tune via env vars:
 
 ```bash
 MBL=20 NFRAMES=120 bash run_inference.sh
-# or load a fine-tuned MA-LMM checkpoint instead of zero-shot:
+# Fine-tuned checkpoint (optional):
 CKPT=/path/to/checkpoint_best.pth bash run_inference.sh
+```
+
+---
+
+## Expected output format
+
+```json
+[
+  {
+    "video_id": "12c36350-aec9-4570-8367-7163ef4f68ca",
+    "n_frames_available": 4605,
+    "num_frames_sampled": 100,
+    "memory_bank_length": 40,
+    "caption": "The video captures a close-up view of a person's hands working on a loom...",
+    "inference_time_sec": 10.1,
+    "gpu_peak_memory_gb": 15.873
+  }
+]
 ```
 
 Captions land in `outputs/captions_{10min,30min,60min}.json`.
 
 ---
 
-## RunPod template recommendation
+## Key parameters
 
-**Pick: `runpod/pytorch:2.0.1-py3.10-cuda11.8.0-devel-ubuntu22.04`** (or
-the equivalent "PyTorch 2.0.1" template on the marketplace).
-
-Why this combo:
-
-| Constraint | Pin | Source |
+| Parameter | Default | Notes |
 |---|---|---|
-| `torch >= 1.10.0` | torch 2.0.1 | `MA-LMM/requirements.txt` |
-| `transformers >= 4.28.0` | 4.28.x is the lowest known good | requirements.txt |
-| `fairscale == 0.4.4` | needs torch ≤ 2.0.x — breaks on 2.1+ | requirements.txt |
-| `timm == 0.4.12` | very old, but layer-norm import works through torch 2.0 | requirements.txt |
-| Vicuna-7b fp16 + ViT-G + Q-Former + 80-frame video | ≥ 24 GB VRAM, **40 GB+ recommended** for 60-min @ 80 frames | empirical |
-
-**CUDA / PyTorch / Python:**
-- **CUDA 11.8**, **PyTorch 2.0.1**, **Python 3.9 or 3.10** — `setup.sh`
-  installs `torch==2.0.1+cu118` from the official wheel index.
-- Avoid PyTorch ≥ 2.1: `fairscale==0.4.4` and `timm==0.4.12` start hitting
-  `torch._six`/`Tensor.storage()` deprecations.
-- Avoid CUDA 12.x base images unless you also bump PyTorch.
-
-**GPU choice on RunPod:**
-- **A100 40 GB** or **A100 80 GB** — safest. The paper trained on 4× A100.
-- **A6000 (48 GB)** / **L40S (48 GB)** — fine for inference with
-  `num_frames=80, memory_bank_length=40`.
-- **RTX 4090 (24 GB)** — works for the 10-min variant; will OOM on the
-  60-min × 80-frame setting unless you drop `num_frames` to ~40.
-
-**Disk:** allocate ≥ 60 GB. Vicuna-7b is ~13 GB, raw Ego4D videos +
-frames at 10 fps can balloon quickly (1 hr × 10 fps ≈ 36 k JPEGs per
-video).
+| `--memory_bank_length` | 40 | Compress Q-Former memory after this many frames |
+| `--num_frames` | 80 | Uniformly sampled frames per video |
+| `--num_beams` | 5 | Beam search width |
+| `--max_len` | 256 | Max caption tokens |
+| `--prompt` | "Describe what happens in this video in detail." | Instruction prefix |
 
 ---
 
-## What `setup.sh` does
+## Bugs found and fixed vs. the original infer.py
 
-1. `git clone https://github.com/boheumd/MA-LMM.git` into `./MA-LMM/`
-2. Creates conda env `malmm_baseline` (Python 3.9)
-3. Installs PyTorch 2.0.1 + CUDA 11.8 wheels, then `pip install -e MA-LMM/`
-4. Downloads `lmsys/vicuna-7b-v1.5` to `MA-LMM/llm/vicuna-7b/`
+Two bugs were present in the original `scripts/infer.py` that produced
+silent wrong results:
 
-If you already have Vicuna weights elsewhere, symlink them and re-run.
+1. **Frame tensor dimension order** — `load_video_frames` returns `[T, C, H, W]`
+   but `model.generate` expects `[B, C, T, H, W]`. Fixed with
+   `.permute(1, 0, 2, 3).unsqueeze(0)` instead of `.unsqueeze(0)` alone.
+
+2. **Wrong sample dict key** — the generate call was passing
+   `"text_input": [prompt]` but the MALMM model reads `"prompt"` (a bare
+   string). Fixed by using `"prompt": args.prompt`.
 
 ---
 
-## Notes vs. the official repo
+## About infer_v2.py
 
-- Inference uses **zero-shot InstructBLIP + MA-LMM** by default (no
-  `--ckpt_path`). For task-specific quality, pass a fine-tuned checkpoint
-  from the [saved_model.tar](https://drive.google.com/file/d/1mq6fg69Ofm32-1HjEunoFtPg8ymAIcOp/view?usp=sharing)
-  bundle distributed by the authors.
-- Frame extraction at 10 FPS replicates `MA-LMM/data/extract_frames.py`.
-- `memory_bank_length=40` and `num_frames=80` match the captioning configs
-  shipped in `MA-LMM/lavis/projects/malmm/cap_youcook2.yaml`.
+`scripts/infer_v2.py` is kept for reference but is **not** the MALMM pipeline.
+It uses a two-stage workaround:
+
+- Stage 1: InstructBLIP-FlanT5-XL captions each frame independently
+- Stage 2: Vicuna-7b receives those text descriptions and summarizes them
+
+Vicuna never sees any video frames in this approach — it is a pure text
+summarizer. Results look like English but do not reflect the MALMM memory
+bank architecture. Use `infer.py` for actual MALMM results.
+
+---
+
+## Dependency pins
+
+| Package | Pin | Reason |
+|---|---|---|
+| `torch` | 2.0.1+cu118 | `fairscale==0.4.4` breaks on ≥ 2.1 |
+| `fairscale` | 0.4.4 | Uses deprecated `torch._six` / `Tensor.storage()` |
+| `timm` | 0.4.12 | Required by LAVIS EVA-CLIP loader |
+| `transformers` | ≥4.28.0, <4.46.0 | LLaMA tokenizer compatibility window |
+| `spacy` | <3.8.0 | Conflicts in newer versions with LAVIS deps |
+| Vicuna | v1.3 | Must match the Q-Former pretrained checkpoint |

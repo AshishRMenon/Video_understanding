@@ -1,0 +1,16 @@
+# cloned repo (large, re-cloned by setup.sh)
+MA-LMM/
+
+# data (videos, frames, annotations — not versioned)
+data/
+
+# inference outputs
+outputs/
+outputs_*/
+
+# runtime artifacts
+preflight_report.json
+__pycache__/
+*.pyc
+*.pth
+*.bin

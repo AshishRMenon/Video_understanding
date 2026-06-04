@@ -92,10 +92,11 @@ def main():
             print(f"[skip] {fdir}: missing")
             continue
 
-        frames = load_video_frames(fdir, args.num_frames).unsqueeze(0).to(args.device)
+        # load_video_frames returns [T, C, H, W]; model.generate expects [B, C, T, H, W]
+        frames = load_video_frames(fdir, args.num_frames).permute(1, 0, 2, 3).unsqueeze(0).to(args.device)
         sample = {
             "image": frames,
-            "text_input": [args.prompt],
+            "prompt": args.prompt,   # generate() reads "prompt", not "text_input"
             "num_frames": args.num_frames,
             "is_video": True,
         }
