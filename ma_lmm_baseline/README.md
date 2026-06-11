@@ -23,10 +23,14 @@ Vicuna receives visual tokens, not text.
 ma_lmm_baseline/
 ├── setup.sh                  # one-time bootstrap (conda, deps, Vicuna download)
 ├── prepare_frames.sh         # FFmpeg frame extraction + annotation JSON
-├── run_inference.sh          # runs infer.py on 10/30/60-min variants
+├── run_inference.sh          # baseline: runs infer.py on 10/30/60-min variants
+├── run_chunked.sh            # Experiment 1: hierarchical chunk-level captioning
+├── run_frame_sweep.sh        # Experiment 2: frame-budget vs quality/compute sweep
 ├── preflight.sh              # optional: scan /workspace/ for pre-existing assets
 ├── scripts/
 │   ├── infer.py              # main inference driver (uses real MALMM pipeline)
+│   ├── infer_chunked.py      # Experiment 1: chunk a video, caption each chunk
+│   ├── plot_sweep.py         # Experiment 2: generate plots from sweep results
 │   ├── infer_v2.py           # two-stage workaround (NOT the MALMM pipeline — kept for reference)
 │   ├── extract_frames.py     # FFmpeg @ 10 FPS
 │   ├── make_annotation.py    # builds MA-LMM-style annotation JSON
@@ -193,6 +197,157 @@ Captions land in `outputs/captions_{10min,30min,60min}.json`.
 | `--num_beams` | 5 | Beam search width |
 | `--max_len` | 256 | Max caption tokens |
 | `--prompt` | "Describe what happens in this video in detail." | Instruction prefix |
+
+---
+
+## Experiment 1 — Hierarchical chunk-level captioning
+
+**Motivation.** MA-LMM's memory bank compresses hour-long context into 32
+visual tokens, but this compression is lossy for very long videos. An
+alternative strategy is to divide the video into short temporal chunks, caption
+each chunk independently, then merge the chunk captions into a single
+video-level summary with Vicuna.
+
+**Two configurations for a 60-min video:**
+
+| Configuration | Chunks | Captions before merge |
+|---|---|---|
+| 10-min chunks | 6 | 6 chunk captions → 1 summary |
+| 1-min chunks | 60 | 60 chunk captions → 1 summary |
+
+**How it works (`scripts/infer_chunked.py`):**
+1. Sort all frame files in a video directory chronologically.
+2. Divide into fixed-size temporal windows (`chunk_duration_min × video_fps` frames each).
+3. Run MA-LMM on each chunk independently (same `num_frames` subsampling per chunk).
+4. Feed all chunk captions as text to the already-loaded Vicuna LLM for a single-paragraph summary.
+
+**Run 10-min chunks (default):**
+
+```bash
+conda activate malmm_baseline
+bash run_chunked.sh
+```
+
+**Run 1-min chunks:**
+
+```bash
+CHUNK_MINS=1 bash run_chunked.sh
+```
+
+**Run both back-to-back:**
+
+```bash
+CHUNK_MINS=10 bash run_chunked.sh
+CHUNK_MINS=1  bash run_chunked.sh
+```
+
+**Environment variable overrides:**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHUNK_MINS` | `10` | Chunk duration in minutes |
+| `VARIANT` | `60min` | Duration split to process (`10min`, `30min`, `60min`) |
+| `NFRAMES` | `80` | MA-LMM frames sampled per chunk |
+| `MBL` | `40` | `memory_bank_length` per chunk |
+| `NO_SUMMARIZE` | _(unset)_ | Set to `1` to skip Vicuna summarization |
+
+**Output** (`outputs/exp1_chunked/<CHUNK_MINS>min_chunks/<video_id>.json`):
+
+```json
+{
+  "video_id": "12c36350-...",
+  "chunk_duration_min": 10,
+  "n_chunks": 6,
+  "num_frames_per_chunk": 80,
+  "memory_bank_length": 40,
+  "total_inference_time_sec": 63.4,
+  "summary": "The video shows a person working in a kitchen...",
+  "chunks": [
+    {
+      "chunk_idx": 0,
+      "start_min": 0,
+      "end_min": 10,
+      "n_frames_in_chunk": 6000,
+      "num_frames_sampled": 80,
+      "caption": "The person prepares ingredients...",
+      "inference_time_sec": 10.1,
+      "gpu_peak_memory_gb": 15.87
+    }
+  ]
+}
+```
+
+---
+
+## Experiment 2 — Frame-budget vs quality / compute trade-off
+
+**Motivation.** The paper's baseline uses 80–100 uniformly sampled frames and
+a memory bank of 40 frames. Increasing both parameters is expected to improve
+caption quality, but at the cost of longer inference time and higher GPU memory.
+This experiment characterizes the quality–compute Pareto frontier so we can
+quantify whether the quality gains justify the added compute.
+
+**What is swept:**
+
+| `num_frames` | `memory_bank_length` | Notes |
+|---|---|---|
+| 100 | 40 | baseline (paper default) |
+| 100 | 80 | larger memory, same input frames |
+| 200 | 40 | 2× frames, baseline memory |
+| 200 | 80 | 2× both |
+| 200 | 160 | 2× frames, full memory (no compression fires) |
+| 400 | 80 | 4× frames, 2× memory |
+| 400 | 160 | 4× frames, 4× memory |
+| 400 | 320 | 4× frames, near-full memory |
+
+The sweep runs on the 10-min variant (fast per-video turnaround; 5 videos give
+sufficient signal for mean ± std error bars). Each configuration records
+per-video `inference_time_sec` and `gpu_peak_memory_gb`.
+
+**Run the sweep:**
+
+```bash
+conda activate malmm_baseline
+bash run_frame_sweep.sh
+```
+
+This runs all 8 configurations sequentially and saves one JSON per config to
+`outputs/exp2_frame_sweep/`. Already-completed configs are skipped
+automatically on re-run.
+
+**Generate plots (compute metrics only):**
+
+```bash
+python scripts/plot_sweep.py \
+    --sweep_dir outputs/exp2_frame_sweep \
+    --plot_dir  outputs/exp2_frame_sweep/plots
+```
+
+**Generate plots with caption quality (ROUGE-L):**
+
+```bash
+python scripts/plot_sweep.py \
+    --sweep_dir  outputs/exp2_frame_sweep \
+    --plot_dir   outputs/exp2_frame_sweep/plots \
+    --narration  /path/to/ego4d/v2/annotations/narration.json \
+    --ann_path   data/annotations/ego4d_10min.json
+```
+
+**Output plots** (saved to `outputs/exp2_frame_sweep/plots/`):
+
+| File | Contents |
+|---|---|
+| `inference_time.png` | Wall-clock inference time vs `num_frames`, one line per `MBL` |
+| `gpu_memory.png` | GPU peak memory vs `num_frames`, one line per `MBL` |
+| `caption_quality.png` | ROUGE-L vs `num_frames` (requires ground truth) |
+| `quality_vs_compute.png` | Pareto scatter: ROUGE-L vs inference time per config |
+
+`plot_sweep.py` also prints a summary table to stdout suitable for a paper
+appendix.
+
+> **GPU note.** The 400-frame configurations require ≥ 40 GB VRAM. If you
+> have only 24 GB, cap the sweep at `num_frames=200` by commenting out the
+> 400-frame rows in `run_frame_sweep.sh`.
 
 ---
 
