@@ -9,6 +9,7 @@ outputs/
 outputs_*/
 
 # runtime artifacts
+logs/
 preflight_report.json
 __pycache__/
 *.pyc

@@ -185,6 +185,16 @@ def main():
     model.memory_bank_length = args.memory_bank_length
     model.use_memory_bank = args.memory_bank_length > 0
     model.num_frames = args.num_frames_per_chunk
+
+    # Expand positional embedding if num_frames_per_chunk exceeds the model's
+    # hard limit (default max_num_frames=120). Zero-init mirrors the model's own
+    # initialization so output is unaffected.
+    if args.num_frames_per_chunk > model.image_pe.num_embeddings:
+        import torch.nn as nn
+        new_pe = nn.Embedding(args.num_frames_per_chunk, model.image_pe.embedding_dim)
+        nn.init.constant_(new_pe.weight, 0.0)
+        model.image_pe = new_pe.to(args.device)
+
     model.eval()
 
     chunk_results = []

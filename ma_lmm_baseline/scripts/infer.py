@@ -77,6 +77,18 @@ def main():
     model.use_memory_bank = args.memory_bank_length > 0
     model.num_frames = args.num_frames
 
+    # image_pe is nn.Embedding(max_num_frames=120, 1408) by default.
+    # Frames beyond index 119 trigger a CUDA out-of-bounds assertion.
+    # The weights are zero-initialized (positional bias starts at 0), so
+    # expanding to a larger table with zeros is safe and has no effect on outputs.
+    if args.num_frames > model.image_pe.num_embeddings:
+        import torch.nn as nn
+        new_pe = nn.Embedding(args.num_frames, model.image_pe.embedding_dim)
+        nn.init.constant_(new_pe.weight, 0.0)
+        model.image_pe = new_pe.to(args.device)
+        print(f"  [info] image_pe expanded to {args.num_frames} positions "
+              f"(was {model.image_pe.num_embeddings})")
+
     if args.ckpt_path:
         print(f"Loading checkpoint {args.ckpt_path}")
         ckpt = torch.load(args.ckpt_path, map_location=args.device)

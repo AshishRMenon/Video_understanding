@@ -25,13 +25,19 @@ ma_lmm_baseline/
 ├── prepare_frames.sh         # FFmpeg frame extraction + annotation JSON
 ├── run_inference.sh          # baseline: runs infer.py on 10/30/60-min variants
 ├── run_chunked.sh            # Experiment 1: hierarchical chunk-level captioning
-├── run_frame_sweep.sh        # Experiment 2: frame-budget vs quality/compute sweep
+├── run_frame_sweep.sh        # Experiment 2: frame-budget vs all-metrics sweep
+├── run_chunk_sweep.sh        # Experiment 4: chunk-size sweep on 30-min videos
+├── run_comparison.sh         # chunked vs. full-video head-to-head comparison
 ├── preflight.sh              # optional: scan /workspace/ for pre-existing assets
 ├── scripts/
 │   ├── infer.py              # main inference driver (uses real MALMM pipeline)
 │   ├── infer_chunked.py      # Experiment 1: chunk a video, caption each chunk
-│   ├── plot_sweep.py         # Experiment 2: generate plots from sweep results
 │   ├── infer_v2.py           # two-stage workaround (NOT the MALMM pipeline — kept for reference)
+│   ├── plot_sweep.py         # Experiment 2: combined metrics graph (Graph 1)
+│   ├── plot_chunk_sweep.py   # Experiment 4: combined metrics graph (Graph 2)
+│   ├── plot_comparison.py    # chunked vs. full-video comparison plot
+│   ├── qa_eval.py            # QA-based caption quality evaluation (macro + micro)
+│   ├── evaluate.py           # standalone ROUGE + BERTScore comparison script
 │   ├── extract_frames.py     # FFmpeg @ 10 FPS
 │   ├── make_annotation.py    # builds MA-LMM-style annotation JSON
 │   └── preflight.py          # scans /workspace/ for assets
@@ -41,6 +47,7 @@ ma_lmm_baseline/
     ├── videos/{10min,30min,60min}/   # put your MP4s here
     ├── frames/{10min,30min,60min}/   # produced by prepare_frames.sh
     └── annotations/                  # produced by prepare_frames.sh
+                                      # ego4d_30min.json auto-generated if missing
 ```
 
 `MA-LMM/` (cloned by `setup.sh`) and `data/` are gitignored — they contain
@@ -279,82 +286,231 @@ CHUNK_MINS=1  bash run_chunked.sh
 
 ---
 
-## Experiment 2 — Frame-budget vs quality / compute trade-off
+## Evaluation metrics
 
-**Motivation.** The paper's baseline uses 80–100 uniformly sampled frames and
-a memory bank of 40 frames. Increasing both parameters is expected to improve
-caption quality, but at the cost of longer inference time and higher GPU memory.
-This experiment characterizes the quality–compute Pareto frontier so we can
-quantify whether the quality gains justify the added compute.
+All experiments share four quality metrics evaluated against Ego4D ground truth.
+ROUGE-L and BERTScore require only the narration file; Macro/Micro QA additionally
+require an Anthropic API key (free tier is sufficient — total cost < $0.10).
 
-**What is swept:**
-
-| `num_frames` | `memory_bank_length` | Notes |
+| Metric | What it measures | Ground truth source |
 |---|---|---|
-| 100 | 40 | baseline (paper default) |
-| 100 | 80 | larger memory, same input frames |
-| 200 | 40 | 2× frames, baseline memory |
-| 200 | 80 | 2× both |
-| 200 | 160 | 2× frames, full memory (no compression fires) |
-| 400 | 80 | 4× frames, 2× memory |
-| 400 | 160 | 4× frames, 4× memory |
-| 400 | 320 | 4× frames, near-full memory |
+| **ROUGE-L** | Lexical overlap between caption and GT | Segment summaries (5-min blocks) |
+| **BERTScore** | Semantic similarity (roberta-large F1) | Segment summaries |
+| **Macro QA** | Coverage of main themes and activity | Segment summaries → LLM questions |
+| **Micro QA** | Coverage of specific details and actions | Fine-grained narrations → LLM questions |
 
-The sweep runs on the 10-min variant (fast per-video turnaround; 5 videos give
-sufficient signal for mean ± std error bars). Each configuration records
-per-video `inference_time_sec` and `gpu_peak_memory_gb`.
+**Ground truth path (Ego4D narration.json):**
+```
+/workspace/ego4d_meta/v2/annotations/narration.json
+```
 
-**Run the sweep:**
+### How the QA metric works
+
+The Macro QA and Micro QA scores are a custom **QAGS-style** evaluation metric
+designed to test whether captions can support Video Question Answering.
+
+**Step 1 — Question generation** (LLM call, done once per video, cached):
+
+Claude is given the ground-truth narration and generates yes/no questions:
+- **Macro questions** (8 per video) — from segment summaries. High-level:
+  *"Does the video show a person weaving fabric on a loom?"*
+- **Micro questions** (8 per video) — from fine-grained narrations. Specific:
+  *"Does the person use a weaving pin to separate threads on the loom?"*
+
+Questions are cached in `qa_cache.json` and reused across all configs,
+so generation only runs once.
+
+**Step 2 — Answer checking** (LLM call, once per video per config):
+
+Claude is given the predicted caption and all 16 questions and answers YES/NO
+for each. This requires semantic understanding that keyword matching cannot provide —
+a caption saying *"working on a loom"* correctly answers *"weaving fabric?"* even
+without exact word overlap.
+
+**Step 3 — Scoring** (no API, just arithmetic):
+
+```
+Macro QA score = answered macro questions / 8   (per video, then averaged)
+Micro QA score = answered micro questions / 8
+Overall QA     = average(Macro QA, Micro QA)
+```
+
+**API cost estimate** — using `claude-haiku-4-5-20251001` (default):
+
+| Step | Calls |
+|---|---|
+| Question generation (5 videos, cached) | 5 |
+| Answer checking — frame sweep (4 configs × 5 videos) | 20 |
+| Answer checking — chunk sweep (3 sizes × 5 videos) | 15 |
+| **Total** | **~40 calls, < $0.10** |
+
+**Run QA evaluation standalone:**
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python scripts/qa_eval.py \
+    --captions_json outputs/captions_10min.json \
+    --narration     /workspace/ego4d_meta/v2/annotations/narration.json \
+    --ann_path      data/annotations/ego4d_10min.json
+```
+
+Use `--model claude-sonnet-4-6` for higher-accuracy evaluation on
+borderline answers.
+
+---
+
+## Experiment 2 — Frame-budget vs. all metrics (Graph 1)
+
+**Motivation.** Both `num_frames` and `memory_bank_length` are scaled together
+to test whether more visual context improves caption quality across all four
+metrics, and whether the quality gain justifies the additional compute.
+
+**Configs swept** (10-min variant, 5 videos):
+
+| `num_frames` | `memory_bank_length` | Scale |
+|---|---|---|
+| 100 | 40 | 1× baseline |
+| 200 | 80 | 2× |
+| 500 | 150 | 5× |
+| 1000 | 300 | 10× |
+
+**Full pipeline** (inference + QA eval + plot):
 
 ```bash
 conda activate malmm_baseline
+
+NARRATION_PATH=/workspace/ego4d_meta/v2/annotations/narration.json \
+ANTHROPIC_API_KEY=sk-ant-... \
 bash run_frame_sweep.sh
 ```
 
-This runs all 8 configurations sequentially and saves one JSON per config to
-`outputs/exp2_frame_sweep/`. Already-completed configs are skipped
-automatically on re-run.
+Without the API key, ROUGE-L and BERTScore are still computed; QA scores are skipped.
 
-**Generate plots (compute metrics only):**
+**Output — Graph 1** (`outputs/exp2_frame_sweep/plots/metrics_vs_frames.png`):
 
-```bash
-python scripts/plot_sweep.py \
-    --sweep_dir outputs/exp2_frame_sweep \
-    --plot_dir  outputs/exp2_frame_sweep/plots
+A single graph with four metric lines on the same axes:
+
+```
+Y-axis: Score (0–1)
+X-axis: (num_frames, memory_bank_length) config label
+
+Lines:  ● ROUGE-L    ■ BERTScore    ▲ Macro QA    ◆ Micro QA
 ```
 
-**Generate plots with caption quality (ROUGE-L):**
+A summary table is also printed to stdout.
+
+> **GPU note.** The 1000-frame config requires ≥ 40 GB VRAM. Use
+> `--no_bertscore` flag to skip the BERTScore model download on first run.
+
+---
+
+## Experiment 4 — Chunk-size sweep on 30-min videos (Graph 2)
+
+**Motivation.** Chunked captioning quality depends heavily on chunk size:
+too short and each chunk lacks context; too long and the memory bank must
+compress more aggressively. This experiment sweeps chunk sizes on 30-min
+videos and evaluates all four metrics to find the optimal granularity.
+
+**Chunk sizes compared** (30-min variant, 5 videos):
+
+| Chunk size | Chunks per video | Frames per chunk |
+|---|---|---|
+| 2 min | 15 | 80 (subsampled) |
+| 5 min | 6 | 80 |
+| 10 min | 3 | 80 |
+
+Each chunk is captioned independently with MA-LMM (`num_frames=80, MBL=40`),
+then Vicuna merges all chunk captions into one video-level summary. All four
+metrics are computed on the final summary.
+
+**Full pipeline:**
 
 ```bash
-python scripts/plot_sweep.py \
-    --sweep_dir  outputs/exp2_frame_sweep \
-    --plot_dir   outputs/exp2_frame_sweep/plots \
-    --narration  /path/to/ego4d/v2/annotations/narration.json \
-    --ann_path   data/annotations/ego4d_10min.json
+conda activate malmm_baseline
+
+NARRATION_PATH=/workspace/ego4d_meta/v2/annotations/narration.json \
+ANTHROPIC_API_KEY=sk-ant-... \
+bash run_chunk_sweep.sh
 ```
 
-**Output plots** (saved to `outputs/exp2_frame_sweep/plots/`):
+**Environment variable overrides:**
 
-| File | Contents |
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHUNK_SIZES` | `"2 5 10"` | Space-separated chunk durations in minutes |
+| `NFRAMES_PER_CHUNK` | `80` | MA-LMM frames sampled per chunk |
+| `MBL_PER_CHUNK` | `40` | `memory_bank_length` per chunk |
+| `QA_MODEL` | `claude-haiku-4-5-20251001` | LLM for QA evaluation |
+
+**Output — Graph 2** (`outputs/exp4_chunk_sweep/plots/chunk_sweep.png`):
+
+A single graph with four metric lines on the same axes:
+
+```
+Y-axis: Score (0–1)
+X-axis: Chunk size (2 min / 5 min / 10 min)
+
+Lines:  ● ROUGE-L    ■ BERTScore    ▲ Macro QA    ◆ Micro QA
+```
+
+Questions are shared via a single `qa_cache.json` across all chunk sizes,
+so question generation (5 API calls) only happens once.
+
+**Expected finding:** Micro QA should be highest for smaller chunks
+(each chunk gets dense per-segment coverage) while Macro QA may plateau
+or improve with larger chunks (more context for the overall summary).
+This gap is the baseline for future models to beat.
+
+---
+
+## Experiment 3 — Chunked vs. full-video head-to-head comparison
+
+**Motivation.** Graph 1 shows how full-video captioning scales with frame budget.
+Graph 2 shows how chunked captioning scales with chunk size. This experiment
+directly compares the best of each approach on the same set of 10-min videos,
+answering: *does hierarchical chunking actually beat end-to-end MA-LMM?*
+
+**What is compared:**
+
+| Approach | Config |
 |---|---|
-| `inference_time.png` | Wall-clock inference time vs `num_frames`, one line per `MBL` |
-| `gpu_memory.png` | GPU peak memory vs `num_frames`, one line per `MBL` |
-| `caption_quality.png` | ROUGE-L vs `num_frames` (requires ground truth) |
-| `quality_vs_compute.png` | Pareto scatter: ROUGE-L vs inference time per config |
+| Chunked | `infer_chunked.py`, 2-min chunks, `num_frames=80, MBL=40` per chunk |
+| Full-video | `infer.py`, best frame budget from Experiment 2 (`num_frames=200, MBL=80`) |
 
-`plot_sweep.py` also prints a summary table to stdout suitable for a paper
-appendix.
+Both approaches are evaluated with all four metrics (ROUGE-L, BERTScore,
+Macro QA, Micro QA). The `qa_cache.json` from Experiment 2 is reused, so
+no additional question-generation API calls are needed.
 
-> **GPU note.** The 400-frame configurations require ≥ 40 GB VRAM. If you
-> have only 24 GB, cap the sweep at `num_frames=200` by commenting out the
-> 400-frame rows in `run_frame_sweep.sh`.
+**Run:**
+
+```bash
+conda activate malmm_baseline
+
+NARRATION_PATH=/workspace/ego4d_meta/v2/annotations/narration.json \
+ANTHROPIC_API_KEY=sk-ant-... \
+bash run_comparison.sh
+```
+
+**Environment variable overrides:**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHUNK_MINS` | `2` | Chunk duration for the chunked approach |
+| `BEST_NF` | `200` | `num_frames` for the full-video approach |
+| `BEST_MBL` | `80` | `memory_bank_length` for the full-video approach |
+
+**Output** (`outputs/exp3_comparison/plots/`):
+- `comparison.png` — grouped bar chart: 4 bars per video (chunked-macro,
+  chunked-micro, full-macro, full-micro), with a printed winner table and
+  per-metric deltas.
 
 ---
 
 ## Bugs found and fixed vs. the original infer.py
 
-Two bugs were present in the original `scripts/infer.py` that produced
-silent wrong results:
+Three bugs were present that either produced silent wrong results or crashed
+with a CUDA assertion:
 
 1. **Frame tensor dimension order** — `load_video_frames` returns `[T, C, H, W]`
    but `model.generate` expects `[B, C, T, H, W]`. Fixed with
@@ -363,6 +519,17 @@ silent wrong results:
 2. **Wrong sample dict key** — the generate call was passing
    `"text_input": [prompt]` but the MALMM model reads `"prompt"` (a bare
    string). Fixed by using `"prompt": args.prompt`.
+
+3. **`image_pe` positional embedding overflow** — `nn.Embedding(max_num_frames=120, 1408)`
+   is hardcoded in `blip2_vicuna_instruct.py`. Any `num_frames > 120` triggers:
+   ```
+   Assertion `srcIndex < srcSelectDimSize` failed.
+   RuntimeError: CUDA error: device-side assert triggered
+   ```
+   The embedding is zero-initialized (a learnable bias that starts at zero),
+   so expanding it to a larger table with zeros is safe and has no effect on
+   outputs. Both `infer.py` and `infer_chunked.py` now patch the embedding
+   after model load if `num_frames > model.image_pe.num_embeddings`.
 
 ---
 
@@ -390,3 +557,6 @@ bank architecture. Use `infer.py` for actual MALMM results.
 | `transformers` | ≥4.28.0, <4.46.0 | LLaMA tokenizer compatibility window |
 | `spacy` | <3.8.0 | Conflicts in newer versions with LAVIS deps |
 | Vicuna | v1.3 | Must match the Q-Former pretrained checkpoint |
+| `anthropic` | latest | Anthropic Python SDK for QA evaluation calls |
+| `bert-score` | latest | BERTScore metric; downloads roberta-large (~500 MB) on first run |
+| `rouge-score` | latest | ROUGE-L computation; installed automatically by plot scripts |

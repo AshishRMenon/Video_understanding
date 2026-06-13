@@ -50,7 +50,7 @@ MBL="${MBL:-40}"
 VIDEO_FPS="${VIDEO_FPS:-10}"
 NO_SUMMARIZE="${NO_SUMMARIZE:-}"
 
-OUT_DIR="outputs/exp1_chunked/${CHUNK_MINS}min_chunks"
+OUT_DIR="outputs_2/exp1_chunked/${CHUNK_MINS}min_chunks"
 FRAME_ROOT="data/frames/${VARIANT}"
 
 mkdir -p "${OUT_DIR}"

@@ -29,20 +29,24 @@
 # per-video captions, inference_time_sec, and gpu_peak_memory_gb.
 #
 # Usage:
-#   bash run_frame_sweep.sh                   # run all 8 configs
-#   VARIANT=30min bash run_frame_sweep.sh     # sweep on 30-min videos instead
+#   bash run_frame_sweep.sh                              # run all 8 configs + compute plots
+#   VARIANT=30min bash run_frame_sweep.sh                # sweep on 30-min videos instead
+#   OUT_PARENT=outputs/2026-06-13 bash run_frame_sweep.sh  # custom output parent folder
 #
-# After completion, generate plots:
-#   python scripts/plot_sweep.py \
-#       --sweep_dir outputs/exp2_frame_sweep \
-#       --plot_dir  outputs/exp2_frame_sweep/plots
+#   # Full pipeline: inference + ROUGE-L + QA evaluation + all plots:
+#   NARRATION_PATH=/workspace/ego4d_meta/v2/annotations/narration.json \
+#   ANTHROPIC_API_KEY=sk-ant-... \
+#   bash run_frame_sweep.sh
 #
-# With caption quality metrics (requires Ego4D narration.json):
-#   python scripts/plot_sweep.py \
-#       --sweep_dir  outputs/exp2_frame_sweep \
-#       --plot_dir   outputs/exp2_frame_sweep/plots \
-#       --narration  /path/to/ego4d/v2/annotations/narration.json \
-#       --ann_path   data/annotations/ego4d_10min.json
+#   # Override QA model (default: claude-haiku-4-5-20251001):
+#   QA_MODEL=claude-sonnet-4-6 NARRATION_PATH=... ANTHROPIC_API_KEY=... bash run_frame_sweep.sh
+#
+# Plots written to outputs/exp2_frame_sweep/plots/:
+#   inference_time.png      always
+#   gpu_memory.png          always
+#   caption_quality.png     requires NARRATION_PATH
+#   quality_vs_compute.png  requires NARRATION_PATH
+#   qa_score.png            requires NARRATION_PATH + ANTHROPIC_API_KEY
 #
 # Prerequisites:
 #   - conda activate malmm_baseline
@@ -53,7 +57,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VARIANT="${VARIANT:-10min}"
-OUT_DIR="outputs/exp2_frame_sweep"
+OUT_PARENT="${OUT_PARENT:-outputs}"
+OUT_DIR="${OUT_PARENT}/exp2_frame_sweep"
+PLOT_DIR="${OUT_DIR}/plots"
+# Optional: set NARRATION_PATH to enable ROUGE-L + QA quality plots.
+#   NARRATION_PATH=/workspace/ego4d_meta/v2/annotations/narration.json bash run_frame_sweep.sh
+NARRATION_PATH="${NARRATION_PATH:-}"
+# Optional: override LLM model used for QA evaluation (default: claude-haiku-4-5-20251001).
+#   QA_MODEL=claude-sonnet-4-6 bash run_frame_sweep.sh
+QA_MODEL="${QA_MODEL:-claude-haiku-4-5-20251001}"
+# Optional: number of questions per video for QA eval (default: 12).
+QA_N_QUESTIONS="${QA_N_QUESTIONS:-12}"
 mkdir -p "${OUT_DIR}"
 
 FRAME_DIR="data/frames/${VARIANT}"
@@ -65,25 +79,24 @@ if [ ! -d "${FRAME_DIR}" ]; then
 fi
 
 # Each entry: "num_frames memory_bank_length"
-# Constraint: mbl <= num_frames (if mbl > num_frames, the memory bank never
-# compresses — effectively the same as mbl = num_frames).
+# Configs form a linear scale-up: both num_frames and memory grow together.
 CONFIGS=(
-    "100  40"
-    "100  80"
-    "200  40"
-    "200  80"
-    "200 160"
-    "400  80"
-    "400 160"
-    "400 320"
+    " 100  40"
+    " 200  80"
+    " 500 150"
+    "1000 300"
 )
 
 total=${#CONFIGS[@]}
 echo "============================================================"
 echo "Experiment 2: Frame-budget sweep"
-echo "  Variant  : ${VARIANT}"
-echo "  Configs  : ${total}"
-echo "  Output   : ${OUT_DIR}"
+echo "  Variant      : ${VARIANT}"
+echo "  Configs      : ${total}"
+echo "  Output       : ${OUT_DIR}"
+echo "  Narration GT : ${NARRATION_PATH:-"(not set — quality + QA plots skipped)"}"
+if [ -n "${NARRATION_PATH}" ]; then
+echo "  QA model     : ${QA_MODEL}  (questions: ${QA_N_QUESTIONS})"
+fi
 echo "============================================================"
 
 idx=0
@@ -112,16 +125,43 @@ done
 echo ""
 echo "============================================================"
 echo "Sweep complete (${total} configurations)."
+echo "============================================================"
+
+# ---- Step 2: QA evaluation (only when narration + API key are available) --
+if [ -n "${NARRATION_PATH}" ]; then
+    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo ""
+        echo "WARNING: ANTHROPIC_API_KEY not set — skipping QA evaluation."
+        echo "  Export the key and re-run to add QA scores:"
+        echo "  ANTHROPIC_API_KEY=sk-ant-... NARRATION_PATH=${NARRATION_PATH} bash run_frame_sweep.sh"
+    else
+        echo ""
+        echo "Running QA evaluation (model: ${QA_MODEL}, questions: ${QA_N_QUESTIONS})…"
+        python scripts/qa_eval.py \
+            --sweep_dir   "${OUT_DIR}" \
+            --narration   "${NARRATION_PATH}" \
+            --ann_path    "${ANN_PATH}" \
+            --model       "${QA_MODEL}" \
+            --n_questions "${QA_N_QUESTIONS}"
+    fi
+fi
+
+# ---- Step 3: Plotting -----------------------------------------------------
 echo ""
-echo "Generate plots (compute only):"
-echo "  python scripts/plot_sweep.py \\"
-echo "      --sweep_dir ${OUT_DIR} \\"
-echo "      --plot_dir  ${OUT_DIR}/plots"
+echo "Generating plots…"
+
+PLOT_CMD=(
+    python scripts/plot_sweep.py
+    --sweep_dir "${OUT_DIR}"
+    --plot_dir  "${PLOT_DIR}"
+)
+
+if [ -n "${NARRATION_PATH}" ]; then
+    PLOT_CMD+=(--narration "${NARRATION_PATH}" --ann_path "${ANN_PATH}")
+fi
+
+"${PLOT_CMD[@]}"
+
 echo ""
-echo "Generate plots (+ caption quality):"
-echo "  python scripts/plot_sweep.py \\"
-echo "      --sweep_dir  ${OUT_DIR} \\"
-echo "      --plot_dir   ${OUT_DIR}/plots \\"
-echo "      --narration  /path/to/ego4d/v2/annotations/narration.json \\"
-echo "      --ann_path   ${ANN_PATH}"
+echo "Plots written to: ${PLOT_DIR}"
 echo "============================================================"
