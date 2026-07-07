@@ -12,13 +12,14 @@ Memory-Augmented Large Multimodal Model (MA-LMM) on Ego4D egocentric videos.
 3. [Frame Loading & Preprocessing](#3-frame-loading--preprocessing)
 4. [Model Architecture Overview](#4-model-architecture-overview)
 5. [Visual Encoder (EVA-CLIP-G ViT)](#5-visual-encoder-eva-clip-g-vit)
-6. [Memory Bank Accumulation](#6-memory-bank-accumulation)
-7. [Memory Bank Compression](#7-memory-bank-compression)
+6. [Visual Memory Bank Accumulation](#6-visual-memory-bank-accumulation)
+7. [Visual Memory Bank Compression](#7-visual-memory-bank-compression)
 8. [Q-Former: Cross-Attention Deep Dive](#8-q-former-cross-attention-deep-dive)
-9. [Projection to LLM Space](#9-projection-to-llm-space)
-10. [Final LLM Input Assembly](#10-final-llm-input-assembly)
-11. [End-to-End Tensor Flow Summary](#11-end-to-end-tensor-flow-summary)
-12. [Compression Payoff — Numbers](#12-compression-payoff--numbers)
+9. [Query Memory Bank — Per-Layer Self-Attention History](#9-query-memory-bank--per-layer-self-attention-history)
+10. [Projection to LLM Space](#10-projection-to-llm-space)
+11. [Final LLM Input Assembly](#11-final-llm-input-assembly)
+12. [End-to-End Tensor Flow Summary](#12-end-to-end-tensor-flow-summary)
+13. [Compression Payoff — Numbers](#13-compression-payoff--numbers)
 
 ---
 
@@ -135,15 +136,25 @@ MA-LMM is **InstructBLIP + Vicuna-7B** with a memory bank extension. Three compo
 │  Visual Encoder  │────▶│    Q-Former     │────▶│  Vicuna-7B LLM │
 │  EVA-CLIP-G ViT  │     │ (BERT-base w/   │     │  (4096-dim)    │
 │  (1408-dim, FROZEN)│   │  cross-attn)    │     │                │
-└──────────────────┘     │  + Memory Bank  │     └────────────────┘
+└──────────────────┘     │  + Memory Banks │     └────────────────┘
                          └─────────────────┘
 ```
 
 - **Visual Encoder**: frozen, processes one frame at a time
-- **Memory Bank**: accumulates per-frame encoder outputs, compresses when it exceeds 40 frames
-- **Q-Former**: 32 learnable query tokens cross-attend to the memory bank → compress everything into 32 vectors
+- **Q-Former**: 32 learnable query tokens; 12 BERT layers with cross-attention every 2 layers
 - **llm_proj**: linear layer bridging Q-Former (768-dim) → LLM (4096-dim)
 - **Vicuna-7B**: generates the caption autoregressively
+
+### Two kinds of memory bank (both from the paper)
+
+MA-LMM maintains **13 memory banks** in parallel, all capped at `memory_bank_length` (default 40) and all compressed by the same `memory_bank_compress` routine:
+
+| Bank | Count | Where it lives | Shape | Fed into |
+|---|---|---|---|---|
+| **Visual memory bank** (`F_t`) | 1 (shared) | `self.visual_memory_bank` on the main model | `[B, T, 257, 1408]` | Q-Former **cross-attention** as `encoder_hidden_states` |
+| **Query memory bank** (`Z_t`) | **12** (one per BERT self-attn layer) | `self.query_memory_bank` on each `MBBertSelfAttention` | `[B, T, 32+L_text, 768]` | That layer's own **self-attention** as prepended K/V history |
+
+The visual bank stores *raw* per-frame ViT features; the query banks store the *evolving* query-token hidden states after each layer's transformations. Both are frame-by-frame accumulators — see §6/§7 for the visual bank and §9 for the query banks.
 
 ---
 
@@ -194,9 +205,9 @@ Adding it encodes *when* in the video this frame occurred.
 
 ---
 
-## 6. Memory Bank Accumulation
+## 6. Visual Memory Bank Accumulation
 
-The memory bank grows frame by frame (`blip2_vicuna_instruct.py:391-396`):
+The visual memory bank grows frame by frame (`blip2_vicuna_instruct.py:385-391`):
 
 ```python
 # t == 0: initialize
@@ -217,10 +228,10 @@ self.compression_size   = torch.cat(
 
 ---
 
-## 7. Memory Bank Compression
+## 7. Visual Memory Bank Compression
 
 When the bank exceeds `memory_bank_length=40` frames, compression runs
-(`blip2.py:358-398`):
+(`blip2_vicuna_instruct.py:406-408`, calling `blip2.py::memory_bank_compress` at lines 352-392):
 
 ```python
 elif self.visual_memory_bank.size(1) > self.memory_bank_length:
@@ -386,7 +397,111 @@ aggregated information from all retained frames in the memory bank.
 
 ---
 
-## 9. Projection to LLM Space
+## 9. Query Memory Bank — Per-Layer Self-Attention History
+
+Cross-attention (§8) is only half the story. The paper also defines a **query memory bank** `Z_t`
+that lives inside the Q-Former's *self-attention* — one **independent** bank per BERT layer, so
+Q-Former with 12 layers has **12 query memory banks** running in parallel with the single visual bank.
+
+### Where it is installed
+
+Not in a subclass file — via a **monkey-patch** at model init time (`blip2.py::apply_memory_bank`,
+lines 394-402):
+
+```python
+def apply_memory_bank(model, memory_bank_length, num_frames):
+    for module in model.modules():
+        if isinstance(module, BertSelfAttention):
+            if memory_bank_length > 0:
+                module.__class__ = MBBertSelfAttention   # ← swap class in place
+                module.memory_bank_length = memory_bank_length
+                module.num_frames = num_frames
+    return model
+```
+
+Called from `init_Qformer` (`blip2.py:217`) right after `BertLMHeadModel.from_pretrained("bert-base-uncased", ...)`.
+Every one of the 12 `BertSelfAttention` instances gets its class rewritten to
+`MBBertSelfAttention` (defined in `blip2.py:46-186`), which is what carries the `self.query_memory_bank` tensor.
+
+### What each layer's bank stores
+
+`MBBertSelfAttention` runs once per frame per layer. On each call it does two things:
+
+**(a) Read history — extend K/V with prior queries** (`blip2.py:72-84`):
+
+```python
+k = self.key(hidden_states)                                # [B, 32+L_text, 768]  current step's K
+v = self.value(hidden_states)                              # [B, 32+L_text, 768]  current step's V
+
+if hasattr(self, 'query_memory_bank'):                     # true from t=1 onward
+    B, T_bank, N_q, C_q = self.query_memory_bank.shape     # [B, T_bank, 32+L_text, 768], T_bank ≤ mbl
+    qmb  = self.query_memory_bank.view(B, -1, C_q)         # [B, T_bank*(32+L_text), 768]
+    qmb_k = torch.cat([self.key(qmb),   k], dim=1)         # [B, (T_bank+1)*(32+L_text), 768]
+    qmb_v = torch.cat([self.value(qmb), v], dim=1)         # [B, (T_bank+1)*(32+L_text), 768]
+    key_layer   = self.transpose_for_scores(qmb_k)         # [B, 12, (T_bank+1)*(32+L_text), 64]
+    value_layer = self.transpose_for_scores(qmb_v)         # [B, 12, (T_bank+1)*(32+L_text), 64]
+```
+
+The current 32 queries then attend over `(T_bank+1)·(32+L_text)` positions — i.e. their own current
+tokens plus every previous timestep's query tokens (up to `memory_bank_length`).
+
+**(b) Write history — append the just-processed queries** (`blip2.py:170-184`):
+
+```python
+if not hasattr(self, 'query_memory_bank'):
+    self.query_memory_bank = hidden_states[:, None, :, :].detach()   # [B, 1, 32+L_text, 768]
+    self.size_constant     = torch.ones(B, 1, N_q).to(...)
+    self.compression_size  = self.size_constant
+else:
+    self.query_memory_bank = torch.cat(
+        [self.query_memory_bank, hidden_states[:, None, :, :].detach()], dim=1
+    )                                                                # [B, T_bank+1, 32+L_text, 768]
+    self.compression_size  = torch.cat([self.compression_size, self.size_constant], dim=1)
+
+if self.compression_size.sum(1).mean().round() == self.num_frames:
+    del self.query_memory_bank
+    del self.compression_size
+elif self.query_memory_bank.size(1) > self.memory_bank_length:
+    self.query_memory_bank, self.compression_size = memory_bank_compress(
+        self.query_memory_bank, self.compression_size
+    )
+```
+
+### Are compression indices shared between visual and query banks?
+
+**No.** Each of the 13 banks calls `memory_bank_compress` **independently** with its own tensor
+and its own `compression_size` counter. Inside the function (`blip2.py:352-392`):
+
+```python
+similarity_matrix     = F.cosine_similarity(bank[:, :-1, :], bank[:, 1:, :], dim=-1)  # [B, T-1, N]
+max_similarity_indices = similarity_matrix.argmax(dim=1, keepdim=True)                 # [B, 1, N]
+```
+
+The `argmax` is computed on **this bank's own contents**. Since:
+
+- The visual bank stores `1408`-dim ViT features across `257` tokens per slot,
+- Each query bank stores `768`-dim BERT hidden states across `32+L_text` tokens per slot,
+- Each layer's query bank starts from a different self-attention transformation,
+
+the 13 cosine-similarity landscapes look totally different → the `max_similarity_indices` are
+different per bank per frame. Not only that: `max_similarity_indices` is shape `[B, 1, N]` — a
+**per-token-position** decision — so within a single bank different token positions can even merge
+different adjacent pairs.
+
+### Practical consequences
+
+- The single `--memory_bank_length` CLI knob in `infer.py` caps **all 13 banks** at the same size
+  (`apply_memory_bank` uses one value for every `MBBertSelfAttention`, and the main model uses the
+  same value for the visual bank).
+- Peak GPU memory during Q-Former is dominated by the sum of all 13 banks' K/V tensors, not just
+  the visual bank. Ablations that raise `memory_bank_length` inflate memory 13× accordingly.
+- The `analyze_memory_saturation.py` diversity metric in this repo only inspects the visual bank's
+  final state — the query banks are deleted at the last frame (`del self.query_memory_bank`), so
+  saturation there is not currently observable without patching.
+
+---
+
+## 10. Projection to LLM Space
 
 After all 12 Q-Former layers (`blip2_vicuna_instruct.py:456`):
 
@@ -407,7 +522,7 @@ to condition the query tokens via self-attention during Q-Former processing.
 
 ---
 
-## 10. Final LLM Input Assembly
+## 11. Final LLM Input Assembly
 
 The prompt text is tokenized and embedded through Vicuna's own embedding table
 (`blip2_vicuna_instruct.py:468-470`):
@@ -433,7 +548,7 @@ text prompt.
 
 ---
 
-## 11. End-to-End Tensor Flow Summary
+## 12. End-to-End Tensor Flow Summary
 
 ```
 infer.py                              blip2_vicuna_instruct.py (generate)
@@ -479,7 +594,12 @@ Raw frames on disk
                                   │        ▼  .view(B, -1, C)                   │  │
                                   │  [B, ≤40*257, 1408]  encoder_hidden_states  │  │
                                   │        │                                    │  │
-                                  │   Q-Former cross-attention                  │  │
+                                  │   Q-Former (12 BERT layers, per frame)       │  │
+                                  │   ├─ self-attention  (all 12 layers) — reads │  │
+                                  │   │   & writes this layer's query_memory_bank│  │
+                                  │   │   (see §9), current 32+L_text queries    │  │
+                                  │   │   attend over (T_bank+1)*(32+L_text) K/V │  │
+                                  │   └─ cross-attention (layers 0,2,4,6,8,10)   │  │
                                   │        │                                    │  │
                                   │  Q: query_tokens [B, 32, 768]               │  │
                                   │     Linear(768→768) → 12 heads              │  │
@@ -517,7 +637,7 @@ Raw frames on disk
 
 ---
 
-## 12. Compression Payoff — Numbers
+## 13. Compression Payoff — Numbers
 
 | Path | Visual tokens entering Vicuna |
 |---|---|
@@ -542,11 +662,13 @@ context window without truncation.
 |---|---|---|
 | Raw frame (one) | `[B, 3, 224, 224]` | After resize + normalize |
 | ViT output (one frame) | `[B, 257, 1408]` | 256 patches + 1 CLS, EVA-CLIP-G width |
-| Memory bank | `[B, ≤40, 257, 1408]` | Capped by compression |
-| Memory bank flattened | `[B, ≤40×257, 1408]` | `encoder_hidden_states` for Q-Former |
+| **Visual memory bank** | `[B, ≤40, 257, 1408]` | Single, shared; feeds cross-attn |
+| Visual bank flattened | `[B, ≤40×257, 1408]` | `encoder_hidden_states` for Q-Former |
+| **Query memory bank** (per layer) | `[B, ≤40, 32+L_text, 768]` | **12 independent copies**, one per BERT self-attn layer; feeds self-attn K/V |
 | Q-Former query tokens | `[B, 32, 768]` | Learnable, BERT-base width |
 | Q-Former K/V (cross-attn) | `[B, 12, t×257, 64]` | After Linear(1408→768) + head split |
 | Q-Former Q (cross-attn) | `[B, 12, 32, 64]` | After Linear(768→768) + head split |
+| Q-Former self-attn K/V (with query bank) | `[B, 12, (T_bank+1)*(32+L_text), 64]` | Prior queries prepended to current-step K/V |
 | Q-Former output (sliced) | `[B, 32, 768]` | Only query positions kept |
 | After llm_proj | `[B, 32, 4096]` | Linear(768→4096) |
 | Prompt text embeddings | `[B, L_prompt, 4096]` | Vicuna embedding table |
